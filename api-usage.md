@@ -26,6 +26,7 @@ Model: `meta-ai-thinking`
 | `POST` | `/api/chat` | main chat endpoint |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat endpoint |
 | `POST` | `/api/upload` | upload a file, get `media_id` to attach |
+| `GET` | `/api/download?url=` | download any file Meta produced (forced file save) |
 | `GET` | `/api/conversations` | list saved chats |
 | `GET` | `/api/conversations/{id}` | full message history for one chat |
 
@@ -40,8 +41,18 @@ curl -X POST https://meta-api-u04m.onrender.com/api/chat \
 Response:
 
 ```json
-{"text":"…","model":"meta-ai-thinking","mode":"thinking","conversation_id":"…","media":[]}
+{"text":"…","model":"meta-ai-thinking","mode":"thinking","conversation_id":"…","media":[],"files":[{"url":"https://…","mime_type":"text/csv","filename":"todo.csv"}]}
 ```
+
+When Meta attaches produced files (CSV, TXT, HTML, PNG, docs, …), they arrive in
+`files[]`. Download any of them:
+
+```bash
+curl -L "https://meta-api-u04m.onrender.com/api/download?url=$(python3 -c 'import urllib.parse; print(urllib.parse.quote("https://…/todo.csv?…"))')" -o todo.csv
+```
+
+Notes: use `files[]` records whose `url` starts with `https://`; Meta CDN links are
+signed and can expire, so download promptly or re-ask Meta to regenerate.
 
 Keep context by echoing back `conversation_id`:
 
