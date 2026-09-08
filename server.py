@@ -214,51 +214,89 @@ def _try_vibes_cookie(value):
     return s
 
 
+def _probe_vibes(v):
+    """Classify a vibes session without starting a new password login here.
+
+    Returns 'ok', 'auth' (401/403: cookie rejected), or 'transport' (network/
+    timeout/5xx: keep the saved session, do NOT password-login for this).
+    """
+    try:
+        v.me()
+        return "ok"
+    except vibes_mod.VibesError as e:
+        return "auth" if getattr(e, "status", None) in (401, 403) else "transport"
+    except Exception:  # noqa: BLE001
+        return "transport"
+
+
 def _get_vibes():
     global _vibes_client
     with _vibes_lock:
-        # reuse verified client
+        saw_auth = False
+        # reuse verified client; a transport blip must not look like a logout
         if _vibes_client is not None:
-            try:
-                _vibes_client.me()
+            st = _probe_vibes(_vibes_client)
+            if st == "ok":
                 return _vibes_client
-            except Exception:  # noqa: BLE001
-                pass
-        # 1) full materialized session (all device cookies) — most reliable
+            if st == "auth":
+                saw_auth = True
+            else:
+                try:
+                    _vibes_client._rebuild_session()
+                    st = _probe_vibes(_vibes_client)
+                    if st == "ok":
+                        return _vibes_client
+                    if st == "auth":
+                        saw_auth = True
+                except Exception:  # noqa: BLE001
+                    pass
+        # 1) full materialized session (all device cookies) — most reliable.
+        #    Probe with reauth=False so verification itself never starts a
+        #    password login; the single quiet login below is the only one.
         s = vibes_mod.auth.load_session()
         if s is not None:
-            try:
-                v = vibes_mod.Vibes(s, reauth=True)
-                v.me()
-                _vibes_client = v
+            st = _probe_vibes(vibes_mod.Vibes(s, reauth=False))
+            if st == "ok":
+                _vibes_client = vibes_mod.Vibes(s, reauth=True)
                 return _vibes_client
-            except Exception:  # noqa: BLE001
-                pass
+            if st == "auth":
+                saw_auth = True
+        if not saw_auth:
+            raise RuntimeError("temporary vibes.ai transport failure — kept the saved session; no password login attempted")
         # 2) fall back to any distinct meta_session candidate (env/file/embedded)
         #    — recovers when the materialized jar is poisoned but a raw cookie
         #    value still works.
         for val in _session_cookie_candidates():
             try:
                 s2 = _try_vibes_cookie(val)
-                v = vibes_mod.Vibes(s2, reauth=True)
-                v.me()
-                _vibes_client = v
-                return _vibes_client
+                if _probe_vibes(vibes_mod.Vibes(s2, reauth=False)) == "ok":
+                    _vibes_client = vibes_mod.Vibes(s2, reauth=True)
+                    return _vibes_client
             except Exception:  # noqa: BLE001
                 continue
-        # 3) full self-healing password flow (seeded device)
+        try:
+            st = vibes_mod.auth.login_status()
+        except Exception:  # noqa: BLE001
+            st = {}
+        if st.get("checkpoint_active"):
+            raise RuntimeError(f"Meta checkpoint active; automatic logins paused ({st.get('checkpoint_error', '')}) — verify once at auth.meta.com, then retry")
+        # 3) exactly one quiet password login (no send-nonce email step)
         if hasattr(vibes_mod, "_fresh_client"):
-            v = vibes_mod._fresh_client(quiet=True)
+            v = vibes_mod._fresh_client(quiet=True, attempts=1)
             if v is not None:
                 _vibes_client = v
                 return _vibes_client
-        s = vibes_mod.auth.login_session(print_fn=lambda *a: print("[vibes-auth]", *a))
+        s = vibes_mod.auth.login_session(print_fn=lambda *a: print("[vibes-auth]", *a), attempts=1)
         if s is not None:
             vibes_mod.auth.save_session(s)
             _vibes_client = vibes_mod.Vibes(s, reauth=True)
             return _vibes_client
-        raise RuntimeError("no working vibes.ai session (embedded dead, password checkpoint) — "
-                           "paste a fresh browser cookie with /cookie or re-login at auth.meta.com")
+        try:
+            st = vibes_mod.auth.login_status()
+        except Exception:  # noqa: BLE001
+            st = {}
+        reason = (st.get("last_reason") or "login failed").strip()
+        raise RuntimeError(f"no working vibes.ai session ({reason}) — paste a fresh browser cookie with /cookie or re-login at auth.meta.com")
 
 
 def _reset_vibes():
@@ -466,32 +504,43 @@ def _refresh_vibes_session():
     A full password login every cycle was triggering Meta's 'new device'
     verification email repeatedly. Instead, this only does a light
     authenticated probe (which also makes Vibes rotate/persist any refreshed
-    cookie, sliding the session forward). A password login is attempted ONLY
-    when both the in-memory client and the on-disk session are dead.
+    cookie, sliding the session forward). A single quiet password login is
+    attempted ONLY after a real 401/403 — never for transport blips, and
+    never while a Meta checkpoint is active.
     """
     global _vibes_client
     with _vibes_lock:
         client = _vibes_client
+    saw_auth = False
     # 1) in-memory client still good?
     if client is not None:
-        try:
-            client.me()
+        st = _probe_vibes(client)
+        if st == "ok":
             return True
-        except Exception:  # noqa: BLE001
-            pass
+        if st == "auth":
+            saw_auth = True
     # 2) on-disk session still good (reload + probe, no login)
     try:
         s = vibes_mod.auth.load_session()
         if s is not None:
-            v = vibes_mod.Vibes(s, reauth=True)
-            v.me()
-            with _vibes_lock:
-                _vibes_client = v
-            return True
+            st = _probe_vibes(vibes_mod.Vibes(s, reauth=False))
+            if st == "ok":
+                with _vibes_lock:
+                    _vibes_client = vibes_mod.Vibes(s, reauth=True)
+                return True
+            if st == "auth":
+                saw_auth = True
     except Exception:  # noqa: BLE001
         pass
-    # 3) last resort: password login (seeded device cookies) + persist
-    s = vibes_mod.auth.login_session(print_fn=lambda *a: None)
+    if not saw_auth:
+        return False
+    try:
+        if vibes_mod.auth.login_status().get("checkpoint_active"):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    # 3) last resort: exactly one quiet password login (no email-OTP step)
+    s = vibes_mod.auth.login_session(print_fn=lambda *a: None, attempts=1)
     if s is not None:
         vibes_mod.auth.save_session(s)
         with _vibes_lock:
@@ -1037,6 +1086,14 @@ async def media_status() -> str:
         parts.append(f"vibes.ai session: OK (user {u.get('username', '?')})")
     except Exception as e:  # noqa: BLE001
         parts.append(f"vibes.ai session: FAILING ({str(e)[:120]})")
+        try:
+            st = vibes_mod.auth.login_status()
+            if st.get("checkpoint_active"):
+                parts.append("vibes.ai logins: PAUSED (Meta checkpoint — verify once in browser)")
+            elif st.get("last_reason"):
+                parts.append(f"vibes.ai logins: last attempt: {st.get('last_reason')}")
+        except Exception:  # noqa: BLE001
+            pass
     removed = _janitor_sweep()
     if removed:
         parts.append(f"janitor: purged {removed} stale file(s)")

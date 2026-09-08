@@ -223,6 +223,59 @@ PASSWORD = os.environ.get("META_PASSWORD", "Anshusingh99")
 APP_ID   = os.environ.get("VIBES_APP_ID", "1301537925115840")
 IMPERSONATE = "chrome_android"
 SESSION_FILE = os.path.join(ROOT_DIR, "session.json")
+
+# ── login-code guard: never spam Meta with repeated password logins ──────
+# A Meta device checkpoint (4652001) can email a verification code. Once it
+# happens, further automatic logins only produce more codes, so block them
+# for a long window instead of retrying.
+_CHECKPOINT = {"until": 0.0, "err": ""}
+_CHECKPOINT_TTL = 24 * 3600
+_LAST_LOGIN = {"ok": False, "reason": "not attempted", "at": 0.0}
+
+
+def _checkpoint_active():
+    try:
+        return time.time() < float(_CHECKPOINT.get("until", 0.0))
+    except Exception:
+        return False
+
+
+def _note_checkpoint(err=""):
+    _CHECKPOINT["until"] = time.time() + _CHECKPOINT_TTL
+    _CHECKPOINT["err"] = str(err)[:160]
+
+
+def _clear_checkpoint():
+    _CHECKPOINT["until"] = 0.0
+    _CHECKPOINT["err"] = ""
+
+
+def _note_login_result(ok, reason=""):
+    _LAST_LOGIN["ok"] = bool(ok)
+    _LAST_LOGIN["reason"] = str(reason)[:200]
+    _LAST_LOGIN["at"] = time.time()
+
+
+def _is_checkpoint(err=None, reason="", body=""):
+    try:
+        code = err.get("code") if isinstance(err, dict) else err
+    except Exception:
+        code = None
+    if str(code) == "4652001":
+        return True
+    blob = f"{err} {reason} {body}".lower()
+    return ("4652001" in blob) or ("unrecognized device" in blob)
+
+
+def login_status():
+    """Non-network auth state for status pages (never triggers a login)."""
+    return {"checkpoint_active": _checkpoint_active(),
+            "checkpoint_until": _CHECKPOINT.get("until", 0.0),
+            "checkpoint_error": _CHECKPOINT.get("err", ""),
+            "last_ok": _LAST_LOGIN.get("ok", False),
+            "last_reason": _LAST_LOGIN.get("reason", ""),
+            "last_at": _LAST_LOGIN.get("at", 0.0)}
+
 # Identity mirrored EXACTLY from the successful incognito login HAR:
 # Android Pixel UA + dpr 3 + ccg EXCELLENT (internally consistent as captured).
 UA = ("Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 "
@@ -332,8 +385,13 @@ def _auth_post(s, url, data, referer):
 
 def _login_once(p_fn):
     """One OIDC login attempt -> curl_cffi Session with meta_session, or None.
-    Choreography mirrored exactly from the successful incognito capture:
-    check-contact-point -> send-nonce -> api/login (password) -> device-based/create."""
+    Password-only choreography: check-contact-point -> api/login (password) ->
+    device-based/create. The email-OTP send-nonce step is intentionally NOT
+    called, so a password login never asks Meta to email a code."""
+    if _checkpoint_active():
+        p_fn("[!] Meta checkpoint active — skipping password login (no new code requested).")
+        p_fn("    One-time fix: verify at https://auth.meta.com in your normal browser, then retry.")
+        return None
     s = requests.Session(impersonate=IMPERSONATE)
     _seed_device_cookies(s)
     wf = str(uuid.uuid4())
@@ -342,6 +400,7 @@ def _login_once(p_fn):
     auth_url = r.headers.get("location", "")
     if not auth_url:
         p_fn("[!] no auth redirect from /api/meta-oidc/start")
+        _note_login_result(False, "no oidc redirect")
         return None
 
     page = None
@@ -353,7 +412,9 @@ def _login_once(p_fn):
         p_fn("[.] auth page served bot-check — retrying…")
         time.sleep(2 + 2 * attempt)
     else:
-        p_fn("[!] auth page parse failed (challenge)"); return None
+        p_fn("[!] auth page parse failed (challenge)")
+        _note_login_result(False, "auth challenge page")
+        return None
     lsd, jaz = page["lsd"], jazoest(page["lsd"])
     csi = str(uuid.uuid4())[:23].replace("-", "")
     common = _common_fields(page, wf)
@@ -376,16 +437,8 @@ def _login_once(p_fn):
     _auth_post(s, "https://auth.meta.com/api/check-contact-point-availability/",
                cp, auth_url)
 
-    # 2) nonce init (matches the successful browser capture; success:true expected.
-    #    Required so the password login below is recognized — omitting it trips
-    #    the 'unrecognized device' checkpoint 4652001.)
-    sn = {"contact_point": EMAIL, "qpl_join_id": uuid.uuid4().hex[:16],
-          "source_app_id": APP_ID, "waterfall_id": wf,
-          "use_fb_cp_nonce": "false", "use_ig_cp_nonce": "false"}
-    sn.update(base)
-    _auth_post(s, "https://auth.meta.com/api/login-email-otp/send-nonce/", sn, auth_url)
-
-    # 3) password (email+password — no OTP code is ever entered)
+    # 2) password only — no email-OTP send-nonce, so Meta is never asked
+    #    to email a login code from this flow.
     enc, _ = encrypt_password(PASSWORD, page["pk"], page["keyId"])
     pl = {"contact_point": EMAIL, "csi": csi, "encrypted_account_id": "",
           "is_contact_point_encrypted": "false", "is_parental_consent_flow": "false",
@@ -409,16 +462,22 @@ def _login_once(p_fn):
     except Exception: pass
     if err is not None:
         code = err.get("code") if isinstance(err, dict) else err
-        p_fn(f"[!] login error {code}  {reason}")
-        if str(code) == "4652001":
-            p_fn("[!] Meta checkpoint 'unrecognized device' — one-time fix:")
-            p_fn("    verify at https://auth.meta.com in your normal browser (log out & back in),")
+        if _is_checkpoint(err, reason, body):
+            _note_checkpoint(f"api/login {code} {reason}")
+            _note_login_result(False, f"checkpoint {code} {reason}".strip())
+            p_fn(f"[!] Meta checkpoint 'unrecognized device' ({code}) — automatic logins paused 24h:")
+            p_fn("    one-time fix: verify at https://auth.meta.com in your normal browser (log out & back in),")
             p_fn("    then run /login again. Instant alternative: /cookie <meta_session value>")
+            return None
+        p_fn(f"[!] login error {code}  {reason}")
+        _note_login_result(False, f"api/login {code} {reason}".strip() or "api/login error")
         return None
     if r.status_code not in (200, 301, 302, 303):
-        p_fn(f"[!] login status {r.status_code}: {body[:200]}"); return None
+        p_fn(f"[!] login status {r.status_code}: {body[:200]}")
+        _note_login_result(False, f"login status {r.status_code}")
+        return None
 
-    # 4) REGISTER THIS DEVICE (mints the ~90-day dbln trust cookie — this is
+    # 3) REGISTER THIS DEVICE (mints the ~90-day dbln trust cookie — this is
     #    what makes every future login 'recognized' and checkpoint-free)
     if cuid and dtsg:
         db = {"account_cuid": cuid, "qpl_join_id": uuid.uuid4().hex[:16]}
@@ -430,22 +489,33 @@ def _login_once(p_fn):
         except Exception:
             pass
 
-    # 5) complete the OIDC redirect chain to collect meta_session
+    # 4) complete the OIDC redirect chain to collect meta_session
     s.get(auth_url, headers=NAV, allow_redirects=True, timeout=30)
     if not any(c.name == "meta_session" for c in s.cookies.jar):
         s.get("https://vibes.ai/", headers={"User-Agent": UA}, allow_redirects=True, timeout=30)
     if not any(c.name == "meta_session" for c in s.cookies.jar):
-        p_fn("[!] login ok but no meta_session cookie"); return None
+        p_fn("[!] login ok but no meta_session cookie")
+        _note_login_result(False, "no meta_session after login")
+        return None
     # persist the FULL jar (device cookies make the next login recognized)
     try:
         save_session(s)
     except Exception:
         pass
+    _clear_checkpoint()
+    _note_login_result(True, "ok")
     return s
 
 def login_session(print_fn=print, attempts=3):
     """Password login with retries + backoff. Returns Session or None."""
     p = print_fn if callable(print_fn) else (lambda *a: None)
+    try:
+        attempts = max(1, int(attempts or 1))
+    except Exception:
+        attempts = 1
+    if _checkpoint_active():
+        p("[!] Meta checkpoint active — skipping password login (no new code requested).")
+        return None
     last_exc = None
     for i in range(attempts):
         try:
@@ -454,7 +524,10 @@ def login_session(print_fn=print, attempts=3):
                 return s
         except Exception as e:  # noqa: BLE001
             last_exc = e
+            _note_login_result(False, f"transport {type(e).__name__}: {e}")
             p(f"[!] login attempt {i + 1}/{attempts} failed: {type(e).__name__} {e}")
+        if _checkpoint_active():
+            break
         if i < attempts - 1:
             time.sleep(1.5 * (i + 1))
     if last_exc:
@@ -654,7 +727,7 @@ class Vibes:
                 return False
             try:
                 import auth as _auth
-                sess = _auth.login_session(print_fn=lambda *a: None)
+                sess = _auth.login_session(print_fn=lambda *a: None, attempts=1)
                 if sess is None:
                     self._reauth_fails += 1
                     return False
@@ -1521,9 +1594,9 @@ def set_ref(path):
     print("[!] upload failed")
     return False
 
-def _fresh_client(quiet=False):
+def _fresh_client(quiet=False, attempts=3):
     """Password-login and return a ready Vibes client (or None)."""
-    s = auth.login_session(print_fn=None if quiet else print)
+    s = auth.login_session(print_fn=None if quiet else print, attempts=attempts)
     if s is None:
         return None
     auth.save_session(s)
@@ -1555,7 +1628,7 @@ def _auto_login():
     print("[*] session dead/missing → regenerating automatically…")
     c = None
     try:
-        c = _fresh_client(quiet=True)
+        c = _fresh_client(quiet=True, attempts=1)
     except Exception:
         c = None
     if c is not None:
