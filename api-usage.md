@@ -62,6 +62,11 @@ curl -X POST https://meta-api-u04m.onrender.com/api/chat \
   -d '{"message":"My name is Alex.","conversation_id":"<CID>"}'
 ```
 
+`/api/chat` fields: `message` (also accepts `prompt`) required; optional
+`conversation_id`, `timeout` (default 300), `attachments[]`
+(`{media_id, mime_type, filename}`), `image_url`/`image_urls` (auto-fetched and
+attached). Errors: `400` for bad input, `500` with `{"error":"…"}` on backend failure.
+
 ### Upload + attach an image
 
 ```bash
@@ -131,7 +136,7 @@ curl -X POST https://media-gen-mcp.onrender.com/api/image \
   -d '{"prompt":"minimal flat logo of a fox","mode":"instant"}'
 ```
 
-Fields: `prompt` required; optional `project_id`, `mode` (`instant` default, or `thinking`), `timeout` (default 180). Response has `urls[]` plus optional `error`.
+Fields: `prompt` required; optional `project_id`, `mode` (`instant` default, or `thinking`), `timeout` (default 180). Response has `urls[]`, `text`, `conversation_id`, or `{"urls":[],"error":"…"}` when the prompt is refused (rephrase it) — never a non-200 on refusal.
 
 ### Video (async)
 
@@ -143,7 +148,7 @@ curl -X POST https://media-gen-mcp.onrender.com/api/video \
 curl https://media-gen-mcp.onrender.com/api/job/<job_id>
 ```
 
-`/api/video` fields: `prompt` required; optional `project_id`, `aspect_ratio` (also `aspect`) default `9:16`, `resolution` default `480p`, `model` (also `videoModel`), `count`/`n` 1–4, `reference_image_url`/`ref_url` for image-to-video, `generationType`/`gen_type` default `t2v`, `timeout` default 420. `/api/job/{id}` returns `running|done|error`; when `done`, `items[]` has `{url,type,thumb}`.
+`/api/video` fields: `prompt` required; optional `project_id`, `aspect_ratio` (also `aspect`) default `9:16`, `resolution` default `480p`, `model` (also `videoModel`), `count`/`n` 1–4, `reference_image_url`/`ref_url` for image-to-video, `generationType`/`gen_type` default `t2v`, `timeout` default 420. `/api/job/{id}` returns `running|done|error` (plus `elapsed_s`); when `done`, `items[]` has `{url,type,thumb}`; unknown id → `404 {"error":"unknown job"}`.
 
 ### Upload, then use the file
 
@@ -171,7 +176,9 @@ curl -X POST https://media-gen-mcp.onrender.com/api/keys -H "Content-Type: appli
 
 ### MCP tools
 
-`POST /mcp` is Streamable HTTP, stateless, no auth. Media tools:
+`POST /mcp` is Streamable HTTP, stateless, no auth. Image edit/transparent/GIF,
+all search tools, voices/library/favorite/delete/status, and lipsync are MCP-only
+(no REST equivalent). Media tools:
 
 `generate_image(prompt, project_id)`, `edit_image(image_url, instruction)`,
 `transparent_image(prompt)`, `make_gif(prompt)`,
@@ -180,7 +187,7 @@ curl -X POST https://media-gen-mcp.onrender.com/api/keys -H "Content-Type: appli
 `create_lipsync(source_url, audio_url, prompt, aspect_ratio, resolution)`,
 `meta_chat(message)`, `web_search(query)`, `deep_research(topic)`,
 `social_search(query)`, `places_search(query)`,
-`list_voices()`, `media_library(media_type, limit)`,
+`list_voices()`, `media_library(media_type, limit)` (`media_type`: `video`|`image`|`audio`),
 `favorite_media(item_id, is_favorited)`, `delete_media(item_id)`, `media_status()`.
 
 Video tools are async: take the returned `job_id`, call `check_generation(job_id)` about every 20s until `done`.
