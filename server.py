@@ -110,11 +110,17 @@ def _media_response(header, urls, note=""):
 
 
 async def meta_ask(message, mode="instant", timeout=240, attachments=None,
-                   attempts=2, conversation_id=None):
-    """Full-capability meta.ai passthrough. Reuses conversation_id for context."""
-    token = meta_client.load_token()
-    if not token:
-        raise RuntimeError("no META_TOKEN available")
+                   attempts=2, conversation_id=None, account=1):
+    """Full-capability meta.ai passthrough. Reuses conversation_id for context.
+    account=1 uses META_TOKEN, account=2 uses META_TOKEN_2 (second account)."""
+    if int(account or 1) == 2:
+        token = meta_client.load_token_2()
+        if not token:
+            raise RuntimeError("no META_TOKEN_2 configured for image account 2")
+    else:
+        token = meta_client.load_token()
+        if not token:
+            raise RuntimeError("no META_TOKEN available")
     conv = conversation_id or str(uuid.uuid4())
     last_err = None
     for attempt in range(attempts):
@@ -1079,7 +1085,9 @@ async def media_status() -> str:
     """Check whether the image (Meta AI) and video (Vibes AI) backends are working."""
     parts = []
     tok = bool(meta_client.load_token())
-    parts.append(f"meta.ai token: {'OK' if tok else 'MISSING'}")
+    parts.append(f"meta.ai token (acct 1): {'OK' if tok else 'MISSING'}")
+    tok2 = bool(meta_client.load_token_2())
+    parts.append(f"meta.ai token (acct 2): {'OK' if tok2 else 'NOT CONFIGURED'}")
     try:
         v = await run_in_threadpool(_get_vibes)
         u = await run_in_threadpool(v.me)
@@ -1180,13 +1188,10 @@ async def api_upload(file: UploadFile = File(...)):
     return JSONResponse(result)
 
 
-@app.post("/api/image")
-async def api_image(req: Request):
+async def _do_image(body, account=1):
+    """Shared image-generation handler. account=1 -> /api/image (primary
+    Meta account), account=2 -> /api/image2 (second Meta account)."""
     try:
-        try:
-            body = await req.json()
-        except Exception:  # noqa: BLE001
-            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
         prompt = str(body.get("prompt", "")).strip()
         project_id = str(body.get("project_id") or "").strip() or None
         mode = str(body.get("mode") or "instant").strip()
@@ -1194,7 +1199,7 @@ async def api_image(req: Request):
             return JSONResponse({"error": "prompt required"}, status_code=400)
         hub = _get_hub_project(project_id) if project_id else None
         cid = hub["conversation_id"] if hub else None
-        res = await meta_ask("/imagine " + prompt, mode=mode if mode in ("instant","thinking") else "instant", timeout=int(body.get("timeout",180)), conversation_id=cid)
+        res = await meta_ask("/imagine " + prompt, mode=mode if mode in ("instant","thinking") else "instant", timeout=int(body.get("timeout",180)), conversation_id=cid, account=account)
         urls = [m["url"] for m in res["media"] if m.get("url")]
         if hub:
             with PROJECTS_LOCK:
@@ -1205,6 +1210,27 @@ async def api_image(req: Request):
         return JSONResponse({"urls": urls, "text": res.get("text","")[:600], "conversation_id": cid or res.get("conversation_id")})
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"error": str(e)[:300]}, status_code=500)
+
+
+@app.post("/api/image")
+async def api_image(req: Request):
+    try:
+        body = await req.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    return await _do_image(body, account=1)
+
+
+@app.post("/api/image2")
+async def api_image2(req: Request):
+    """Second-account image endpoint (META_TOKEN_2). Same request/response
+    shape as /api/image. Use this when /api/image reports a quota/limit error
+    — each Meta account has its own image-generation quota."""
+    try:
+        body = await req.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    return await _do_image(body, account=2)
 
 
 @app.post("/api/video")

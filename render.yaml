@@ -11,6 +11,8 @@ services:
         value: 3.12.2
       - key: META_TOKEN
         sync: false   # optional: overrides the embedded token if set
+      - key: META_TOKEN_2
+        sync: false   # second Meta account token (powers /api/image2)
       - key: META_EMAIL
         sync: false   # optional: overrides the embedded login email
       - key: META_PASSWORD

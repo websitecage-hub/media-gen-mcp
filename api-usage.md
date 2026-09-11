@@ -119,7 +119,8 @@ Base: `https://media-gen-mcp.onrender.com`
 | `GET`/`HEAD` | `/app` | production hub GUI |
 | `GET` | `/api/projects?kind=image\|video\|animate` | list projects; omit `kind` for all |
 | `POST` | `/api/projects` | create project: `{"kind":"image","name":"…"}` |
-| `POST` | `/api/image` | generate image from text |
+| `POST` | `/api/image` | generate image from text (account 1) |
+| `POST` | `/api/image2` | generate image from text (account 2, quota fallback) |
 | `POST` | `/api/video` | start video job, returns `job_id` |
 | `GET` | `/api/job/{job_id}` | poll video job until `done` |
 | `POST` | `/api/upload` | upload file, get `url` + `media_id` handles |
@@ -137,6 +138,25 @@ curl -X POST https://media-gen-mcp.onrender.com/api/image \
 ```
 
 Fields: `prompt` required; optional `project_id`, `mode` (`instant` default, or `thinking`), `timeout` (default 180). Response has `urls[]`, `text`, `conversation_id`, or `{"urls":[],"error":"…"}` when the prompt is refused (rephrase it) — never a non-200 on refusal.
+
+### Second image account (`/api/image2`)
+
+Each Meta account has its own image quota. `POST /api/image2` is identical to
+`/api/image` but served by a second account (`META_TOKEN_2`). Agent pattern:
+try `/api/image` first; if the error text mentions quota/limit/exhausted,
+retry the same body against `/api/image2`:
+
+```bash
+curl -X POST https://media-gen-mcp.onrender.com/api/image2 \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"minimal flat logo of a fox","mode":"instant"}'
+```
+
+Setup: set the `META_TOKEN_2` env var on Render to the second account’s `ecto1:…`
+DGW token (grab it from a browser logged in as that account: DevTools → Network →
+gateway websocket → `Authorization` param). It is env-only by design and never
+written to git. Until it’s set, `/api/image2` returns
+`{"error":"no META_TOKEN_2 configured for image account 2"}`.
 
 ### Video (async)
 

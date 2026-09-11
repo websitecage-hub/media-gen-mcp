@@ -296,6 +296,18 @@ def save_token(t):
         LOOG.error(f"save_token: {e}\n{traceback.format_exc()}")
         return False
 
+def load_token_2():
+    """Second Meta account DGW token. Env-only (META_TOKEN_2) by design, so
+    the second account secret never lands in token.txt, embedded payloads,
+    or git. Returns "" when not configured."""
+    try:
+        t = os.environ.get("META_TOKEN_2", "").strip()
+        if t and len(t) > 20:
+            return t
+    except Exception as e:
+        LOOG.error(f"load_token_2: {e}")
+    return ""
+
 
 
 
