@@ -25,6 +25,7 @@ import glob
 import hashlib
 import json
 import os
+import random
 import secrets
 import tempfile
 import threading
@@ -220,14 +221,20 @@ def _try_vibes_cookie(value):
     return s
 
 
-def _probe_vibes(v):
+def _probe_vibes(v, light=False):
     """Classify a vibes session without starting a new password login here.
 
     Returns 'ok', 'auth' (401/403: cookie rejected), or 'transport' (network/
     timeout/5xx: keep the saved session, do NOT password-login for this).
+    light=True uses the cheap /auth/check-token ping (the same keep-warm call
+    Meta's own web app makes) instead of the full /auth/me profile fetch.
     """
     try:
-        v.me()
+        if light:
+            if not v.check_token():
+                return "transport"
+        else:
+            v.me()
         return "ok"
     except vibes_mod.VibesError as e:
         return "auth" if getattr(e, "status", None) in (401, 403) else "transport"
@@ -286,17 +293,13 @@ def _get_vibes():
             st = {}
         if st.get("checkpoint_active"):
             raise RuntimeError(f"Meta checkpoint active; automatic logins paused ({st.get('checkpoint_error', '')}) — verify once at auth.meta.com, then retry")
-        # 3) exactly one quiet password login (no send-nonce email step)
+        # 3) exactly one guarded quiet login (checkpoint pause + cooldown are
+        #    enforced inside login_session, so concurrent triggers can't stack)
         if hasattr(vibes_mod, "_fresh_client"):
             v = vibes_mod._fresh_client(quiet=True, attempts=1)
             if v is not None:
                 _vibes_client = v
                 return _vibes_client
-        s = vibes_mod.auth.login_session(print_fn=lambda *a: print("[vibes-auth]", *a), attempts=1)
-        if s is not None:
-            vibes_mod.auth.save_session(s)
-            _vibes_client = vibes_mod.Vibes(s, reauth=True)
-            return _vibes_client
         try:
             st = vibes_mod.auth.login_status()
         except Exception:  # noqa: BLE001
@@ -505,14 +508,12 @@ def _janitor_sweep():
 
 
 def _refresh_vibes_session():
-    """Keep the session alive WITHOUT forced re-login.
+    """1-minute session warmer (mirrors the browser's own check-token pings).
 
-    A full password login every cycle was triggering Meta's 'new device'
-    verification email repeatedly. Instead, this only does a light
-    authenticated probe (which also makes Vibes rotate/persist any refreshed
-    cookie, sliding the session forward). A single quiet password login is
-    attempted ONLY after a real 401/403 — never for transport blips, and
-    never while a Meta checkpoint is active.
+    A light authenticated probe keeps the cookie sliding forward (Vibes
+    rotates/persists refreshed cookies on any successful call). A single
+    guarded quiet login runs ONLY after a real 401/403 — never for transport
+    blips, never during checkpoint pause or login cooldown.
     """
     global _vibes_client
     with _vibes_lock:
@@ -520,7 +521,7 @@ def _refresh_vibes_session():
     saw_auth = False
     # 1) in-memory client still good?
     if client is not None:
-        st = _probe_vibes(client)
+        st = _probe_vibes(client, light=True)
         if st == "ok":
             return True
         if st == "auth":
@@ -529,7 +530,7 @@ def _refresh_vibes_session():
     try:
         s = vibes_mod.auth.load_session()
         if s is not None:
-            st = _probe_vibes(vibes_mod.Vibes(s, reauth=False))
+            st = _probe_vibes(vibes_mod.Vibes(s, reauth=False), light=True)
             if st == "ok":
                 with _vibes_lock:
                     _vibes_client = vibes_mod.Vibes(s, reauth=True)
@@ -540,28 +541,24 @@ def _refresh_vibes_session():
         pass
     if not saw_auth:
         return False
-    try:
-        if vibes_mod.auth.login_status().get("checkpoint_active"):
-            return False
-    except Exception:  # noqa: BLE001
-        pass
-    # 3) last resort: exactly one quiet password login (no email-OTP step)
-    s = vibes_mod.auth.login_session(print_fn=lambda *a: None, attempts=1)
-    if s is not None:
-        vibes_mod.auth.save_session(s)
-        with _vibes_lock:
-            _vibes_client = vibes_mod.Vibes(s, reauth=True)
-        return True
+    # 3) last resort: one guarded quiet login (shared checkpoint/cooldown)
+    if hasattr(vibes_mod, "_fresh_client"):
+        v = vibes_mod._fresh_client(quiet=True, attempts=1)
+        if v is not None:
+            with _vibes_lock:
+                _vibes_client = v
+            return True
     return False
 
 
 async def _session_refresher_loop():
-    # Probe often enough that the meta_session cookie slides forward on the
-    # authenticated `me()` calls, so it effectively never expires while the
-    # service is up. Only on a genuine multi-hour outage would a full
-    # password login be needed.
+    # Warm the session the way Meta's own web app does: a light check-token
+    # ping about every minute (slight jitter so it doesn't look metronomic).
+    # Successful pings slide the cookie forward, so it effectively never
+    # expires while the service is up. Password login only ever happens on a
+    # real 401/403, guarded by the shared checkpoint pause + login cooldown.
     while True:
-        await asyncio.sleep(20 * 60)
+        await asyncio.sleep(60 + random.uniform(-10, 10))
         try:
             await run_in_threadpool(_refresh_vibes_session)
         except Exception:  # noqa: BLE001

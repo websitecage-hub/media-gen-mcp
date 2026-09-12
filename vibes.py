@@ -227,10 +227,14 @@ SESSION_FILE = os.path.join(ROOT_DIR, "session.json")
 # ── login-code guard: never spam Meta with repeated password logins ──────
 # A Meta device checkpoint (4652001) can email a verification code. Once it
 # happens, further automatic logins only produce more codes, so block them
-# for a long window instead of retrying.
+# for a long window instead of retrying. Quiet (automatic) logins additionally
+# share a short cooldown, so concurrent triggers can never stack logins.
 _CHECKPOINT = {"until": 0.0, "err": ""}
 _CHECKPOINT_TTL = 24 * 3600
 _LAST_LOGIN = {"ok": False, "reason": "not attempted", "at": 0.0}
+_QUIET_LOGIN_COOLDOWN_S = 15 * 60
+_last_quiet_attempt = 0.0
+_login_attempt_lock = threading.Lock()
 
 
 def _checkpoint_active():
@@ -548,16 +552,29 @@ def _login_once(p_fn):
     _note_login_result(True, "ok")
     return s
 
-def login_session(print_fn=print, attempts=3):
-    """Password login with retries + backoff. Returns Session or None."""
+def login_session(print_fn=print, attempts=3, quiet=False):
+    """Password login with retries + backoff. Returns Session or None.
+
+    quiet=True marks an AUTOMATIC login: it is skipped while a checkpoint
+    pause is active and while another quiet attempt ran recently, so background
+    triggers can never stack logins (or login-code emails). Explicit manual
+    logins pass quiet=False and always try.
+    """
+    global _last_quiet_attempt
     p = print_fn if callable(print_fn) else (lambda *a: None)
     try:
         attempts = max(1, int(attempts or 1))
     except Exception:
         attempts = 1
-    if _checkpoint_active():
-        p("[!] Meta checkpoint active — skipping password login (no new code requested).")
-        return None
+    if quiet:
+        if _checkpoint_active():
+            p("[!] Meta checkpoint active — skipping password login (no new code requested).")
+            return None
+        with _login_attempt_lock:
+            now = time.time()
+            if now - _last_quiet_attempt < _QUIET_LOGIN_COOLDOWN_S:
+                return None
+            _last_quiet_attempt = now
     last_exc = None
     for i in range(attempts):
         try:
@@ -769,7 +786,8 @@ class Vibes:
                 return False
             try:
                 import auth as _auth
-                sess = _auth.login_session(print_fn=lambda *a: None, attempts=1)
+                sess = _auth.login_session(print_fn=lambda *a: None, attempts=1,
+                                             quiet=True)
                 if sess is None:
                     self._reauth_fails += 1
                     return False
@@ -1638,7 +1656,8 @@ def set_ref(path):
 
 def _fresh_client(quiet=False, attempts=3):
     """Password-login and return a ready Vibes client (or None)."""
-    s = auth.login_session(print_fn=None if quiet else print, attempts=attempts)
+    s = auth.login_session(print_fn=None if quiet else print, attempts=attempts,
+                           quiet=quiet)
     if s is None:
         return None
     auth.save_session(s)
