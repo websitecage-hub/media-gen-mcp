@@ -127,6 +127,7 @@ Base: `https://media-gen-mcp.onrender.com`
 | `GET` | `/api/download?url=<encoded>` | download a generated file as attachment |
 | `GET` | `/api/keys` | list masked API keys |
 | `POST` | `/api/keys` | mint a new `sk-…` key |
+| `POST` | `/api/session` | paste a fresh browser `meta_session` cookie to heal video instantly (verified before saving) |
 | `POST` | `/mcp` | MCP tools for Claude/ChatGPT |
 
 ### Image
@@ -183,6 +184,16 @@ curl -X POST https://media-gen-mcp.onrender.com/api/video \
 ```
 
 Use `url` as `reference_image_url`/`image_url`; use `media_id` for Meta-side editing.
+
+### Heal video with a browser cookie (no password login)
+
+```bash
+curl -X POST https://media-gen-mcp.onrender.com/api/session \
+  -H "Content-Type: application/json" \
+  -d '{"meta_session":"<value from DevTools → Application → Cookies → vibes.ai → meta_session>"}'
+# {"ok":true,"username":"…"} — verified with /auth/me before saving;
+# a rejected value returns 400 and is never persisted.
+```
 
 ### Projects and keys
 

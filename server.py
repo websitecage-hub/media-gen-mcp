@@ -302,7 +302,7 @@ def _get_vibes():
         except Exception:  # noqa: BLE001
             st = {}
         reason = (st.get("last_reason") or "login failed").strip()
-        raise RuntimeError(f"no working vibes.ai session ({reason}) — paste a fresh browser cookie with /cookie or re-login at auth.meta.com")
+        raise RuntimeError(f"no working vibes.ai session ({reason}) — POST the fresh browser cookie to /api/session, or re-login at auth.meta.com")
 
 
 def _reset_vibes():
@@ -1339,6 +1339,47 @@ async def api_create_key(req: Request):
     newk="sk-"+__import__("secrets").token_urlsafe(32)
     keys.add(newk); _save_api_keys(keys)
     return JSONResponse({"api_key":newk})
+
+
+@app.post("/api/session")
+async def api_inject_session(req: Request):
+    """Heal video instantly by pasting a fresh browser cookie — no password login.
+
+    Body: {"meta_session": "<value from DevTools → Application → Cookies →
+    vibes.ai → meta_session"}. The cookie is verified with /auth/me BEFORE it
+    is saved; a rejected value is never persisted.
+    """
+    try:
+        body = await req.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    val = str(body.get("meta_session") or "").strip().strip('"').strip("'")
+    if not val or len(val) < 8:
+        return JSONResponse({"error": "meta_session required"}, status_code=400)
+
+    def _verify_and_save():
+        global _vibes_client
+        from curl_cffi import requests as _rq
+        s = _rq.Session(impersonate="chrome_android")
+        s.cookies.set("meta_session", val, domain=".vibes.ai", path="/")
+        s.cookies.set("cookie_ack", "true", domain=".vibes.ai", path="/")
+        v = vibes_mod.Vibes(s, reauth=False)
+        u = v.me()  # raises on failure — nothing saved yet
+        vibes_mod.auth.save_session(s)
+        with _vibes_lock:
+            _vibes_client = vibes_mod.Vibes(s, reauth=True)
+        try:
+            vibes_mod.auth._clear_checkpoint()
+        except Exception:  # noqa: BLE001
+            pass
+        return u
+
+    try:
+        u = await run_in_threadpool(_verify_and_save)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": f"cookie rejected ({str(e)[:120]}) — not saved"},
+                            status_code=400)
+    return JSONResponse({"ok": True, "username": u.get("username", "?")})
 
 # ── web app ───────────────────────────────────────────────────────────────
 
