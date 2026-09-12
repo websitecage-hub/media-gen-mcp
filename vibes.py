@@ -280,20 +280,21 @@ def login_status():
             "last_reason": _LAST_LOGIN.get("reason", ""),
             "last_at": _LAST_LOGIN.get("at", 0.0)}
 
-# Identity mirrored EXACTLY from the successful incognito login HAR:
-# Android Pixel UA + dpr 3 + ccg EXCELLENT (internally consistent as captured).
+# Identity mirrored EXACTLY from the successful browser login HARs
+# (vibes-armadilo-otp-success / -only-pass): Pixel 9 / Android 15 /
+# Chrome 152, dpr 3, ccg GOOD. Navigation requests carry only the base
+# client hints; the full hint set goes on XHR posts (see _auth_post).
 UA = ("Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36")
-NAV = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "(KHTML, like Gecko) Chrome/152.0.0.0 Mobile Safari/537.36")
+NAV = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
        "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
+       "Cache-Control": "no-cache", "Pragma": "no-cache", "Priority": "u=0, i",
        "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "cross-site",
+       "Sec-Fetch-User": "?1",
        "Upgrade-Insecure-Requests": "1",
-       "sec-ch-ua": '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
+       "sec-ch-ua": '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
        "sec-ch-ua-mobile": "?1",
-       "sec-ch-ua-platform": '"Android"',
-       "sec-ch-ua-platform-version": '"15"',
-       "sec-ch-ua-model": '"Pixel 9"',
-       "sec-ch-prefers-color-scheme": "dark"}
+       "sec-ch-ua-platform": '"Android"'}
 
 def encrypt_password(password, pub_hex, key_id):
     ts = int(time.time()); aes_key = os.urandom(32)
@@ -363,7 +364,7 @@ def _seed_device_cookies(s):
 def _common_fields(p, wf, req="h"):
     """Anti-bot form fields mirrored from the successful login capture."""
     return {"__user": "0", "__a": "1", "__req": req, "__hs": p["hs"],
-            "dpr": "3", "__ccg": "EXCELLENT", "__rev": p["__rev"],
+            "dpr": "3", "__ccg": "GOOD", "__rev": p["__rev"],
             "__s": p.get("__s", ""), "__hsi": p["hsi"],
             "__dyn": p.get("__dyn", ""), "__csr": p.get("__csr", ""),
             "__hsdp": p.get("__hsdp", ""), "__hblp": p.get("__hblp", ""),
@@ -374,11 +375,12 @@ def _common_fields(p, wf, req="h"):
 def _auth_post(s, url, data, referer):
     return s.post(url, data=data, headers={
         "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "*/*", "Cache-Control": "no-cache", "Pragma": "no-cache",
         "Origin": "https://auth.meta.com", "Referer": referer, "X-ASBD-ID": "359341",
         "X-FB-LSD": data.get("lsd", ""), "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin",
-        "sec-ch-ua": '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
-        "sec-ch-ua-full-version-list": '"Not=A?Brand";v="99.0.0.0", "Google Chrome";v="151.0.7922.174", "Chromium";v="151.0.7922.174"',
+        "sec-ch-ua": '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
+        "sec-ch-ua-full-version-list": '"Chromium";v="152.0.7977.83", "Not?A_Brand";v="24.0.0.0", "Google Chrome";v="152.0.7977.83"',
         "sec-ch-ua-mobile": "?1",
         "sec-ch-ua-platform": '"Android"',
         "sec-ch-ua-platform-version": '"15"',
@@ -405,8 +407,10 @@ def _login_once(p_fn):
     except Exception:
         _seeded_ms = set()
     wf = str(uuid.uuid4())
+    _nav_start = dict(NAV)
+    _nav_start["Referer"] = "https://vibes.ai/"
     r = s.get("https://vibes.ai/api/meta-oidc/start", params={"waterfall_id": wf},
-              headers={"User-Agent": UA}, allow_redirects=False, timeout=30)
+              headers=_nav_start, allow_redirects=False, timeout=30)
     auth_url = r.headers.get("location", "")
     if not auth_url:
         p_fn("[!] no auth redirect from /api/meta-oidc/start")
@@ -426,7 +430,10 @@ def _login_once(p_fn):
         _note_login_result(False, "auth challenge page")
         return None
     lsd, jaz = page["lsd"], jazoest(page["lsd"])
-    csi = str(uuid.uuid4())[:23].replace("-", "")
+    # csi mirrors the browser: 23 mixed-case alphanumerics (never uuid-hex)
+    _csi_alphabet = ("abcdefghijklmnopqrstuvwxyz"
+                     "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+    csi = "".join(random.choice(_csi_alphabet) for _ in range(23))
     common = _common_fields(page, wf)
     base = dict(common); base.update({"lsd": lsd, "jazoest": jaz})
 
@@ -507,8 +514,18 @@ def _login_once(p_fn):
         except Exception:
             pass
 
-    # 5) complete the OIDC redirect chain to collect meta_session
-    s.get(auth_url, headers=NAV, allow_redirects=True, timeout=30)
+    # 5) complete the OIDC redirect chain to collect meta_session, exactly
+    #    like the browser: GET /login/?redirect_uri=<oidc-url> and follow it
+    #    through /oidc/ -> ecto -> vibes callback (NOT a bare GET of auth_url,
+    #    which stalls on the login page instead of completing the exchange).
+    from urllib.parse import quote as _quote
+    try:
+        s.get("https://auth.meta.com/login/?redirect_uri=" + _quote(auth_url, safe=""),
+              headers=NAV, allow_redirects=True, timeout=30)
+    except Exception:
+        pass
+    if not any(c.name == "meta_session" for c in s.cookies.jar):
+        s.get(auth_url, headers=NAV, allow_redirects=True, timeout=30)
     if not any(c.name == "meta_session" for c in s.cookies.jar):
         s.get("https://vibes.ai/", headers={"User-Agent": UA}, allow_redirects=True, timeout=30)
     if not any(c.name == "meta_session" for c in s.cookies.jar):
