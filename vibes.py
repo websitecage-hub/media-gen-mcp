@@ -385,9 +385,10 @@ def _auth_post(s, url, data, referer):
 
 def _login_once(p_fn):
     """One OIDC login attempt -> curl_cffi Session with meta_session, or None.
-    Password-only choreography: check-contact-point -> api/login (password) ->
-    device-based/create. The email-OTP send-nonce step is intentionally NOT
-    called, so a password login never asks Meta to email a code."""
+    Choreography mirrored exactly from the successful incognito capture:
+    check-contact-point -> send-nonce -> api/login (password) ->
+    device-based/create. No OTP code is ever entered; the nonce call only
+    prepares the login the way the real browser does."""
     if _checkpoint_active():
         p_fn("[!] Meta checkpoint active — skipping password login (no new code requested).")
         p_fn("    One-time fix: verify at https://auth.meta.com in your normal browser, then retry.")
@@ -437,8 +438,16 @@ def _login_once(p_fn):
     _auth_post(s, "https://auth.meta.com/api/check-contact-point-availability/",
                cp, auth_url)
 
-    # 2) password only — no email-OTP send-nonce, so Meta is never asked
-    #    to email a login code from this flow.
+    # 2) nonce init (matches the successful browser capture; success:true
+    #    expected). This step is required — without it the login completes but
+    #    the minted session is rejected by the API (401 on first use).
+    sn = {"contact_point": EMAIL, "qpl_join_id": uuid.uuid4().hex[:16],
+          "source_app_id": APP_ID, "waterfall_id": wf,
+          "use_fb_cp_nonce": "false", "use_ig_cp_nonce": "false"}
+    sn.update(base)
+    _auth_post(s, "https://auth.meta.com/api/login-email-otp/send-nonce/", sn, auth_url)
+
+    # 3) password (email+password — no OTP code is ever entered)
     enc, _ = encrypt_password(PASSWORD, page["pk"], page["keyId"])
     pl = {"contact_point": EMAIL, "csi": csi, "encrypted_account_id": "",
           "is_contact_point_encrypted": "false", "is_parental_consent_flow": "false",
@@ -477,7 +486,7 @@ def _login_once(p_fn):
         _note_login_result(False, f"login status {r.status_code}")
         return None
 
-    # 3) REGISTER THIS DEVICE (mints the ~90-day dbln trust cookie — this is
+    # 4) REGISTER THIS DEVICE (mints the ~90-day dbln trust cookie — this is
     #    what makes every future login 'recognized' and checkpoint-free)
     if cuid and dtsg:
         db = {"account_cuid": cuid, "qpl_join_id": uuid.uuid4().hex[:16]}
@@ -489,7 +498,7 @@ def _login_once(p_fn):
         except Exception:
             pass
 
-    # 4) complete the OIDC redirect chain to collect meta_session
+    # 5) complete the OIDC redirect chain to collect meta_session
     s.get(auth_url, headers=NAV, allow_redirects=True, timeout=30)
     if not any(c.name == "meta_session" for c in s.cookies.jar):
         s.get("https://vibes.ai/", headers={"User-Agent": UA}, allow_redirects=True, timeout=30)
