@@ -395,6 +395,11 @@ def _login_once(p_fn):
         return None
     s = requests.Session(impersonate=IMPERSONATE)
     _seed_device_cookies(s)
+    try:
+        _seeded_ms = {c.value for c in s.cookies.jar
+                      if c.name == "meta_session" and c.value}
+    except Exception:
+        _seeded_ms = set()
     wf = str(uuid.uuid4())
     r = s.get("https://vibes.ai/api/meta-oidc/start", params={"waterfall_id": wf},
               headers={"User-Agent": UA}, allow_redirects=False, timeout=30)
@@ -505,6 +510,34 @@ def _login_once(p_fn):
     if not any(c.name == "meta_session" for c in s.cookies.jar):
         p_fn("[!] login ok but no meta_session cookie")
         _note_login_result(False, "no meta_session after login")
+        return None
+    try:
+        _fresh_ms = {c.value for c in s.cookies.jar
+                     if c.name == "meta_session" and c.value} - _seeded_ms
+    except Exception:
+        _fresh_ms = set()
+    # 6) prove the session authenticates BEFORE persisting it — never save an
+    #    unverified jar (that is how a dead session kept "healing" forever).
+    try:
+        Vibes(s, reauth=False)._req("GET", "/auth/me", tries=2, timeout=20)
+        verified = True
+        verify_err = None
+    except Exception as e:  # noqa: BLE001
+        verified = False
+        verify_err = e
+    if not verified:
+        if not _fresh_ms:
+            p_fn("[!] login finished but no FRESH meta_session was minted "
+                 "(only the stale seeded cookie is present) — not saving it")
+            _note_login_result(False, "stale meta_session only (no fresh cookie minted)")
+        elif isinstance(verify_err, VibesError) and getattr(verify_err, "status", None) in (401, 403):
+            p_fn("[!] fresh login minted a session the API rejects "
+                 f"({getattr(verify_err, 'status', '')}) — not saving it")
+            _note_login_result(False, "fresh session rejected by /auth/me "
+                                      f"({getattr(verify_err, 'status', '')})")
+        else:
+            p_fn(f"[!] could not verify fresh session ({verify_err}) — not saving it")
+            _note_login_result(False, f"verify failed: {verify_err}")
         return None
     # persist the FULL jar (device cookies make the next login recognized)
     try:
