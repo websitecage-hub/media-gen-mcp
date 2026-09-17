@@ -236,6 +236,18 @@ _QUIET_LOGIN_COOLDOWN_S = 15 * 60
 _last_quiet_attempt = 0.0
 _login_attempt_lock = threading.Lock()
 
+# Auto (quiet) password logins are OFF by default: every attempt hits
+# auth.meta.com check-contact + login-email-otp/send-nonce + api/login,
+# which pages the account with OTP/login emails. Heal via POST
+# /api/session cookie paste (server.py) or explicit /login instead.
+# Set VIBES_AUTO_LOGIN=1 to re-enable quiet logins. Manual logins
+# (quiet=False) always work regardless of this flag.
+def _auto_login_enabled():
+    try:
+        return os.environ.get("VIBES_AUTO_LOGIN", "0").strip() == "1"
+    except Exception:
+        return False
+
 
 def _checkpoint_active():
     try:
@@ -575,7 +587,9 @@ def login_session(print_fn=print, attempts=3, quiet=False):
     quiet=True marks an AUTOMATIC login: it is skipped while a checkpoint
     pause is active and while another quiet attempt ran recently, so background
     triggers can never stack logins (or login-code emails). Explicit manual
-    logins pass quiet=False and always try.
+    logins pass quiet=False and always try. Quiet logins are additionally
+    gated behind VIBES_AUTO_LOGIN=1 (default off — each attempt sends
+    OTP/login mail), so the live service can never spam the account.
     """
     global _last_quiet_attempt
     p = print_fn if callable(print_fn) else (lambda *a: None)
@@ -584,6 +598,8 @@ def login_session(print_fn=print, attempts=3, quiet=False):
     except Exception:
         attempts = 1
     if quiet:
+        if not _auto_login_enabled():
+            return None
         if _checkpoint_active():
             p("[!] Meta checkpoint active — skipping password login (no new code requested).")
             return None
@@ -795,8 +811,15 @@ class Vibes:
 
     def _maybe_reauth(self):
         """Silent password re-login on 401 — thread-safe, repeatable
-        (capped at 5 consecutive failures, counter resets on success)."""
+        (capped at 5 consecutive failures, counter resets on success).
+        No-op unless VIBES_AUTO_LOGIN=1: each attempt sends OTP/login
+        mail, so the live service must heal via cookie paste instead."""
         if not self.reauth:
+            return False
+        try:
+            if not _auto_login_enabled():
+                return False
+        except Exception:
             return False
         with self._reauth_lock:
             if self._reauth_fails >= 5:
@@ -1695,8 +1718,14 @@ _AUTO_BACKOFF = 30           # seconds between attempts, grows each fail
 def _auto_login():
     """Regenerate a dead/missing session automatically: password flow
     (seeded device cookies make it look like the same browser), then save
-    + re-embed the new cookie. Backs off between failed attempts."""
+    + re-embed the new cookie. Backs off between failed attempts.
+    Disabled unless VIBES_AUTO_LOGIN=1 (each attempt sends OTP mail)."""
     global C
+    try:
+        if not _auto_login_enabled():
+            return False
+    except Exception:
+        return False
     now = time.time()
     if _auto["fails"] >= _AUTO_MAX_FAILS:
         return False

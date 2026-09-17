@@ -294,7 +294,9 @@ def _get_vibes():
         if st.get("checkpoint_active"):
             raise RuntimeError(f"Meta checkpoint active; automatic logins paused ({st.get('checkpoint_error', '')}) — verify once at auth.meta.com, then retry")
         # 3) exactly one guarded quiet login (checkpoint pause + cooldown are
-        #    enforced inside login_session, so concurrent triggers can't stack)
+        #    enforced inside login_session, so concurrent triggers can't stack).
+        #    Quiet logins are OFF unless VIBES_AUTO_LOGIN=1 (each attempt sends
+        #    OTP/login mail), so this is normally a no-op: heal via cookie paste.
         if hasattr(vibes_mod, "_fresh_client"):
             v = vibes_mod._fresh_client(quiet=True, attempts=1)
             if v is not None:
@@ -513,7 +515,8 @@ def _refresh_vibes_session():
     A light authenticated probe keeps the cookie sliding forward (Vibes
     rotates/persists refreshed cookies on any successful call). A single
     guarded quiet login runs ONLY after a real 401/403 — never for transport
-    blips, never during checkpoint pause or login cooldown.
+    blips, never during checkpoint pause or login cooldown — and only when
+    VIBES_AUTO_LOGIN=1 (default off, to never send OTP/login mail).
     """
     global _vibes_client
     with _vibes_lock:
@@ -541,7 +544,8 @@ def _refresh_vibes_session():
         pass
     if not saw_auth:
         return False
-    # 3) last resort: one guarded quiet login (shared checkpoint/cooldown)
+    # 3) last resort: one guarded quiet login (shared checkpoint/cooldown;
+    #    no-op unless VIBES_AUTO_LOGIN=1 — never send OTP mail by default)
     if hasattr(vibes_mod, "_fresh_client"):
         v = vibes_mod._fresh_client(quiet=True, attempts=1)
         if v is not None:
